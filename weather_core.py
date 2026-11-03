@@ -4,6 +4,7 @@ Data: ERA5 reanalysis served by Open-Meteo (free, no API key).
 Everything here is plain Python so it can also be imported from a notebook.
 """
 import calendar
+import math
 import time
 from datetime import date
 from pathlib import Path
@@ -12,7 +13,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
-from scipy import stats
+
+try:                                    # scipy is optional: the app still runs without it
+    from scipy import stats as _scipy_stats
+except ImportError:
+    _scipy_stats = None
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
@@ -24,6 +29,39 @@ CACHE_DIR = Path(".cache")              # downloaded chunks are saved here, so r
 BENCH_SWING_C = 10                      # threshold used when the benchmark summary.csv was made
 
 BLUE, RED, ORANGE, GREEN, GRAY = "#1f77b4", "#d62728", "#ff7f0e", "#2ca02c", "#7f7f7f"
+
+
+
+# --------------------------------------------------------------------------- trend helpers (numpy only)
+
+def theil_sen(x, y):
+    """Median of all pairwise slopes, plus the matching intercept (same result as scipy's theilslopes)."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    i, j = np.triu_indices(len(x), k=1)
+    dx = x[j] - x[i]
+    ok = dx != 0
+    slope = np.median((y[j] - y[i])[ok] / dx[ok])
+    return slope, np.median(y) - slope * np.median(x)
+
+
+def kendall_p(x, y):
+    """p-value for 'is there any monotonic trend?'. Uses scipy when available, else a normal approximation."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    if _scipy_stats is not None:
+        return float(_scipy_stats.kendalltau(x, y)[1])
+    n = len(x)
+    i, j = np.triu_indices(n, k=1)
+    s = np.sum(np.sign(x[j] - x[i]) * np.sign(y[j] - y[i]))
+
+    def ties(v):
+        t = np.unique(v, return_counts=True)[1]
+        t = t[t > 1]
+        return float(np.sum(t * (t - 1) * (2 * t + 5)))
+
+    var = (n * (n - 1) * (2 * n + 5) - ties(x) - ties(y)) / 18
+    if var <= 0:
+        return 1.0
+    return float(math.erfc(abs(s) / math.sqrt(var) / math.sqrt(2)))
 
 
 class DailyLimitReached(Exception):
@@ -163,8 +201,8 @@ def trend_table(annual):
         a = annual.dropna(subset=[m])
         if len(a) < 8:
             continue
-        slope = stats.theilslopes(a[m].values, a["year"].values)[0]
-        _, p = stats.kendalltau(a["year"].values, a[m].values)
+        slope = theil_sen(a["year"].values, a[m].values)[0]
+        p = kendall_p(a["year"].values, a[m].values)
         rows.append({"metric": label, "change_per_decade": round(slope * 10, 3), "p_value": round(p, 3),
                      "clear_trend": "yes" if p < 0.05 else "no"})
     return pd.DataFrame(rows)
@@ -243,7 +281,7 @@ def plot_change_hist(d):
 def _trend_line(ax, x, y, color="black"):
     ok = ~np.isnan(y)
     if ok.sum() >= 8:
-        slope, icpt = stats.theilslopes(y[ok], x[ok])[:2]
+        slope, icpt = theil_sen(x[ok], y[ok])
         ax.plot(x, icpt + slope * x, color=color, lw=2)
         return slope * 10
     return None
